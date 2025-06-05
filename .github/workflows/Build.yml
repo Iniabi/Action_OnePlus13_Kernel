@@ -1,0 +1,302 @@
+name: OnePlus13
+
+on:
+  workflow_dispatch:
+    inputs:
+      FILE:
+        description: "Configuration file"
+        required: true
+        type: choice
+        default: oneplus_13
+        options: ['oneplus_13', 'JiuGeFaCai_oneplus_13_v']
+      KSU_CONFIG:
+        description: "Select KernelSU"
+        required: true
+        type: choice
+        options: ['SukiSU_dev', 'SukiSU_stable']
+        default: SukiSU_dev
+      BUILD_METHOD:
+        description: "Build method"
+        required: true
+        type: choice
+        options: ['bazel', 'clang']
+        default: clang
+      KERNEL_TIME:
+        description: "Kernel build date"
+        required: true
+        default: '2024-12-17 23:36:49 UTC'
+      KERNEL_NAME:
+        description: "Kernel name"
+        required: true
+        default: '-android15-8-g013ec21bba94-abogki383916444-4k'
+      enable_KPM:
+        description: "Enablle KPM"
+        required: false
+        default: false
+        type: boolean
+      Release:
+        description: "Create Release"
+        required: false
+        default: false
+        type: boolean
+        
+permissions:
+  contents: write  
+jobs:
+  build:
+    name: ${{ inputs.FILE == 'oneplus_13' && 'oneplus' || inputs.FILE == 'JiuGeFaCai_oneplus_13_v' && 'JiuGeFaCai'}}(${{ inputs.BUILD_METHOD == 'clang' && 'Clang' || 'Bazel' }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Environment
+        run: |
+          WORKSPACE_DIR="$GITHUB_WORKSPACE/kernel_workspace"
+          PLATFORM_DIR="$WORKSPACE_DIR/kernel_platform"
+          COMMON_DIR="$PLATFORM_DIR/common"
+          
+          echo "WORKSPACE=$WORKSPACE_DIR" >> $GITHUB_ENV
+          echo "PLATFORM=$PLATFORM_DIR" >> $GITHUB_ENV
+          echo "COMMON=$COMMON_DIR" >> $GITHUB_ENV
+          echo "KERNEL_VERSION=android15-6.6" >> $GITHUB_ENV
+
+      - name: Maximize Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Install Dependencies
+        run: |
+          git config --global user.name "build"
+          git config --global user.email "anexplreaders@gmail.com"
+          sudo apt update && sudo apt upgrade -y
+          sudo apt install libelf-dev -y
+          
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
+      - name: Repo Sync
+        run: |
+          mkdir "$WORKSPACE" && cd "$WORKSPACE"
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b refs/heads/oneplus/sm8750 -m ${{ inputs.FILE }}.xml --depth=1
+          repo sync -c -j$(nproc --all)
+          
+      - name: KernelSU Version
+        if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') }}
+        run: |
+          if [[ "${{ inputs.KSU_CONFIG }}" == "SukiSU_dev" ]]; then 
+            SukiSU_BRANCH="susfs-dev"
+          else 
+            SukiSU_BRANCH="susfs-stable"
+          fi
+          echo "SukiSU_BRANCH=$SukiSU_BRANCH" >> $GITHUB_ENV
+
+      - name: SukiSU Setup
+        if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') }}
+        run: |
+          cd "$PLATFORM"
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s ${{ env.SukiSU_BRANCH }}
+          
+          cd ./KernelSU
+          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 10606)
+          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+          export KSU_VERSION=$KSU_VERSION
+          sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+          echo "VERSION：$KSU_VERSION"
+
+      - name: Apply SUSFS
+        run: |
+          cd "$WORKSPACE"
+          git clone https://github.com/ShirkNeko/SukiSU_patch.git
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.KERNEL_VERSION }}
+          
+          # Copy patches
+          cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.KERNEL_VERSION }}.patch "$COMMON/"
+          cp ./susfs4ksu/kernel_patches/fs/* "$COMMON/fs/"
+          cp ./susfs4ksu/kernel_patches/include/linux/* "$COMMON/include/linux/"
+          
+          # Patches apply
+          cd "$COMMON"
+          sed -i '/#include <trace\/hooks\/blk.h>/a #include <trace/hooks/fs.h>' fs/namespace.c
+          patch -p1 < "50_add_susfs_in_gki-${{ env.KERNEL_VERSION }}.patch"
+
+      - name: Apply Hooks
+        run: |
+          cd "$WORKSPACE"
+          cp ./SukiSU_patch/hooks/syscall_hooks.patch "$COMMON/"
+          
+          cd "$COMMON"
+          patch -p1 -F 3 < "syscall_hooks.patch"
+
+      - name: Apply GKI
+        run: |
+          cd "$WORKSPACE"
+          git clone https://github.com/Iniabi/sched_ext
+          mv ./sched_ext/hmbird_patch.c "$PLATFORM/common/drivers"
+          cd "$PLATFORM/common/drivers"
+          
+          if ! grep -q "hmbird_patch.o" Makefile; then
+            echo "obj-y += hmbird_patch.o" >> Makefile
+          fi
+
+      - name: Configure Kernel
+        run: |
+          cd "$WORKSPACE"
+          
+          # Remove protected exports and strings
+          rm $PLATFORM/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
+          rm $PLATFORM/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
+          
+          # Adjust localversion strings
+          sed -i 's/check_defconfig//' "$PLATFORM/common/build.config.gki"
+          sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$COMMON/scripts/setlocalversion"
+          
+          # Replace kernel name strings
+          sed -i '$s|echo "${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}${scm_version}"|echo "\${KERNELVERSION}${{ inputs.KERNEL_NAME }}"|' "$COMMON/scripts/setlocalversion"
+          
+          # Add sched
+          cd "$WORKSPACE"
+          cp -r ./sched_ext/* "$COMMON/kernel/sched"
+
+          DEFCONFIG="$COMMON/arch/arm64/configs/gki_defconfig"
+          [[ "${{ inputs.enable_KPM }}" == "true" ]] && echo "CONFIG_KPM=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$DEFCONFIG"
+
+      - name: Build Kernel
+        run: |
+          if [[ "${{ inputs.BUILD_METHOD }}" == "bazel" ]]; then
+            cd "$PLATFORM"
+            
+            export SOURCE_DATE_EPOCH=$(date -d "${{ inputs.KERNEL_TIME }}" +%s)
+            echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >> "$GITHUB_ENV"
+            
+            tools/bazel run --config=stamp //common:kernel_aarch64_dist -- --dist_dir=out || { echo "内核构建失败"; exit 1; }
+          elif [[ "${{ inputs.BUILD_METHOD }}" == "clang" ]]; then
+            cd "$COMMON"
+            
+            PREBUILT_CLANG="${{ env.PLATFORM }}/prebuilts/clang/host/linux-x86/clang-r510928/bin"
+            PREBUILT_RUST="${{ env.PLATFORM }}/prebuilts/rust/linux-x86/1.73.0b/bin"
+            PREBUILT_KERNEL_TOOLS="${{ env.PLATFORM }}/prebuilts/kernel-build-tools/linux-x86/bin"
+            
+            export KBUILD_BUILD_TIMESTAMP=$(date -d "${{ inputs.KERNEL_TIME }}" -u "+%a %b %d %H:%M:%S %Z %Y")
+            export PATH="$PREBUILT_CLANG:$PATH"
+            export PATH="$PREBUILT_RUST:$PATH"
+            export PATH="$PREBUILT_KERNEL_TOOLS:$PATH"
+            
+            BUILD_ARGS=(
+              "-j$(nproc --all)"
+              "LLVM=1"
+              "O=out"
+              "ARCH=arm64"
+              "CC=$PREBUILT_CLANG/clang"
+              "CXX=$PREBUILT_CLANG/clang++"
+              "LD=$PREBUILT_CLANG/ld.lld"
+              "AR=$PREBUILT_CLANG/llvm-ar"
+              "NM=$PREBUILT_CLANG/llvm-nm"
+              "OBJCOPY=$PREBUILT_CLANG/llvm-objcopy"
+              "PAHOLE=$PREBUILT_KERNEL_TOOLS/pahole"
+              "RUSTC=$PREBUILT_RUST/rustc"
+              "CROSS_COMPILE=aarch64-linux-gnu-"
+            )
+          
+            make "${BUILD_ARGS[@]}" gki_defconfig all
+          fi
+          
+      - name: Make AnyKernel3
+        run: |
+          cd "$WORKSPACE" && mkdir -p Out
+          
+          git clone https://github.com/Kernel-SU/AnyKernel3.git --depth=1
+          
+          if [[ "${{ inputs.BUILD_METHOD }}" == "bazel" ]]; then
+            IMAGE_DIR="$PLATFORM/out/"
+          else
+            IMAGE_DIR="$COMMON/out/arch/arm64/boot/"
+          fi
+          
+          # Copy Image
+          if [ -f "$IMAGE_DIR/Image" ]; then
+            cp "$IMAGE_DIR/Image" "$WORKSPACE/AnyKernel3/"
+            cp "$IMAGE_DIR/Image" "$WORKSPACE/Out/"
+          else
+            exit 1
+          fi
+          
+          # Copy boot.img
+          if [ -f "$IMAGE_DIR/boot.img" ]; then
+            cp "$IMAGE_DIR/boot.img" "$WORKSPACE/Out/"
+          else
+            echo "跳过复制"
+          fi
+          
+      - name: Set Device
+        run: |
+          MODEL="${{ inputs.FILE }}"
+          MODEL="${MODEL#*oneplus_}"
+          MODEL="${MODEL%%_*}"
+          DEVICE="OnePlus$MODEL"
+          echo "DEVICE=$DEVICE" >> $GITHUB_ENV
+          
+      - name: Zip AnyKernel3
+        run: |
+          cd "$WORKSPACE/AnyKernel3"
+          zip -r "$WORKSPACE/${{ env.DEVICE }}-${{ env.KSUVER }}.zip" *
+          
+      - name: Apply patch_linux
+        if: ${{ inputs.enable_KPM }}
+        run: |
+          cd "$WORKSPACE/Out"
+          curl -LO https://github.com/ShirkNeko/SukiSU_KernelPatch_patch/releases/download/0.11-beta/patch_linux
+          chmod +x patch_linux && ./patch_linux
+          rm -rf patch_linux
+          cp oImage "$WORKSPACE/AnyKernel3/Image"
+          
+      - name: Upload AnyKernel3
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ env.DEVICE }}-${{ env.KSUVER }}"
+          path: ${{ env.WORKSPACE }}/AnyKernel3/*
+          
+      - name: Upload Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: "Image-${{ env.DEVICE }}-${{ env.KSUVER }}"
+          path: ${{ env.WORKSPACE }}/Out/*
+          
+      - name: Create Release
+        if: ${{ inputs.Release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "${{ env.DEVICE }}-${{ env.KSUVER }}"
+          tag_name: "${{ env.KSUVER }}"
+          body: |
+            - KernelSU: `${{ env.SukiSU_BRANCH }}`
+            - KPM: `${{ inputs.enable_KPM }}`
+            - Build: `${{ inputs.BUILD_METHOD }}`
+          files: |
+            ${{ env.WORKSPACE }}/${{ env.DEVICE }}-${{ env.KSUVER }}.zip
+            ${{ env.WORKSPACE }}/Out/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
